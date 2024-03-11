@@ -61,13 +61,13 @@ library(GSEABase)
 ```
 
 
-# Single cell object (found on GEO - see accession number in manuscript)
+# Single cell object
 
 With de-multiplexed samples (see Material and method for information about the de-multiplexing)
 
 ```{r sce}
 ## Read RDS object containing single cell object
-sce = readRDS('SingleCellExperiment.rds')
+sce = readRDS('SingleCellExperiment.rds') # data processed found under GSE261266
 ```
 
 
