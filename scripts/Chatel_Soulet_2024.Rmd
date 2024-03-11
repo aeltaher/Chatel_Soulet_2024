@@ -67,7 +67,7 @@ With de-multiplexed samples (see Material and method for information about the d
 
 ```{r sce}
 ## Read RDS object containing single cell object
-sce = readRDS('SingleCellExperiment.rds') # data processed found under GSE261266
+sce = readRDS('SingleCellExperiment.rds') # data processed found under GSEXXXXXX
 ```
 
 
