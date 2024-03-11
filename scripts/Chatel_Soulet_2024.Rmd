@@ -1,0 +1,867 @@
+---
+title: "Châtel-Soulet et al. 2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo     = TRUE,
+                      cache    = TRUE,
+                      cache.lazy = FALSE,
+                      prompt   = FALSE,
+                      tidy     = TRUE,
+                      comment  = NA,
+                      message  = FALSE,
+                      collapse = FALSE)
+
+```
+
+
+# Environnement
+
+```{r library, echo=FALSE}
+library(beepr)
+library(RColorBrewer)
+library(viridis)
+library(gplots)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(ggrepel)
+library(tidyverse)
+library(org.Mm.eg.db)
+library(ensembldb)
+library(edgeR)
+library(limma)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(mvoutlier)
+library(DropletUtils)
+library(SingleR)
+library(Seurat)
+library(dynamicTreeCut)
+library(WGCNA)
+library(cluster)
+library(batchelor)
+library(RSQLite)
+library(scDblFinder)
+library(randomcoloR)
+library(batchelor)
+library(scuttle)
+library(nortest)
+library(ggpubr)
+library(bluster)
+library(vioplot)
+library(GEOquery)
+library(moe430a.db)
+library(BiocParallel)
+library(AUCell)
+library(GSEABase)
+```
+
+
+# Single cell object (found on GEO - see accession number in manuscript)
+
+With de-multiplexed samples (see Material and method for information about the de-multiplexing)
+
+```{r sce}
+## Read RDS object containing single cell object
+sce = readRDS('SingleCellExperiment.rds')
+```
+
+
+# Quality Control
+
+QC metrics to identify low-quality cells based on their expression profiles: 
+
+  * The library size
+  * The number of expressed features in each cell (mainly genes and mitochondrial genes)
+  
+
+```{r QC_metrics, echo=FALSE}
+## Basic library properties for each cell
+# Mitochondrial genes
+is.mito = grepl("^mt-", rowData(sce)$SYMBOL)
+# Ribosomal genes
+is.ribo = grepl("^Rp(l|s)", rowData(sce)$SYMBOL)
+# Cytoplasmic genes
+is.cyto =  rowData(sce)$SYMBOL %in% c("Actb", "Tmsb10", "Tmsb4x")
+
+## QC metrics
+##  library size, Number of gene expressed, proportion of reads mapped to features
+stats = perCellQCMetrics(sce, subsets=list(MT=is.mito, RIBO=is.ribo, CYTO=is.cyto), flatten=FALSE)
+sce$scater_qc = stats
+
+## Identifying low-quality cells with adaptive thresholds (see material and method section)
+
+# Library size:
+discard.sum = sce$scater_qc$sum < 2511 
+# Percentage dicarded:
+length(which(discard.sum))/ncol(sce)*100 #  8.35 percent
+
+# Number of gene expressed:
+discard.detected = sce$scater_qc$detected < 1250
+length(which(discard.detected))/ncol(sce)*100 #  8.1 % discarded
+
+# Cells with more than 0 or max 10% of mitochondrial gene
+discard.mito = sce$scater_qc$subsets$MT$percent > 10 | sce$scater_qc$subsets$MT$percent == 0
+discard.mito[is.na(discard.mito)] = TRUE
+table(discard.mito) # discard 5,955, keep 113,082
+
+
+# Summary
+data.frame(BySum=sum(discard.sum),
+           ByFeature=sum(discard.detected),
+           ByMito=sum(discard.mito),
+           Remaining=sum(!discard.sum & !discard.detected & !discard.mito ))
+
+
+## Removing low-quality cells
+sce = sce[, !discard.sum & !discard.detected & !discard.mito]
+```
+
+# Doublet detection
+
+```{r doublet_dectection, echo=FALSE}
+# Doublet detection by simulation
+set.seed(100)
+sce = scDblFinder(sce, verbose=TRUE, samples="replicate_id")
+
+# Clean-up metadata
+colData(sce)$scDblFinder = colData(sce)[, grepl("scDblFinder", colnames(colData(sce)))]
+colData(sce) = colData(sce)[, !grepl("scDblFinder\\.", colnames(colData(sce)))]
+```
+
+# Normalisation
+
+Normalization by deconvolution
+
+```{r normalisation, echo=FALSE}
+# Change rownames GENEID to SYMBOL
+rownames(sce) = rowData(sce)$SYMBOL
+
+# Record average expression
+ave.counts = calculateAverage(sce) 
+rowData(sce)$ave.count = ave.counts
+
+# Gene high in ambient RNA
+to_tag <- vector()
+allAmbiant = NULL
+for (samp in unique(sce$SampleName)){
+   pos = grep(samp, colnames(rowData(sce)))
+   ambient = rowData(sce)[,pos]
+   ambient = ambient[order(ambient$ambient,decreasing = T),]
+   ## Tag everything that has a proportion in the ambient RNA higher than 0.001 (0.1%)
+   ambient = ambient[which(ambient$ambient>0.001 & !is.na(ambient$ambient)),]
+   ## Tag the genes in sce object
+   to_tag <- unique(c(to_tag, row.names(ambient)))
+ }
+rowData(sce)$high_in_ambient <- rowData(sce)$GENEID %in% to_tag
+high_ambiant =  rownames(rowData(sce))[which(rowData(sce)$high_in_ambient==TRUE)]
+
+# Pre-clustering step
+bpPar = MulticoreParam(workers = 4, RNGseed = 1234)
+set.seed(1234)
+clusters = quickCluster(sce, 
+                          use.ranks=FALSE, method = "igraph",
+                          BSPARAM=BiocSingular::IrlbaParam(),BPPARAM = bpPar)
+colData(sce)$quickCluster = factor(clusters) 
+
+
+# Compute Size factors 
+sce = scran::computeSumFactors(sce, 
+                                cluster = colData(sce)$quickCluster,
+                                subset.row= rowData(sce)$high_in_ambient== FALSE,
+                                positive = TRUE,
+                                min.mean = 0.1)
+# Normalisation
+sce = logNormCounts(sce)
+
+```
+
+# Feature selection
+
+```{r feature_selection, echo=FALSE}
+# Quantifying technical noise
+set.seed(100)
+dec.pois = modelGeneVarByPoisson(sce)
+## Store it in the single cell object
+rowData(sce)$decomposeVar = dec.pois
+dec.pois = cbind(dec.pois, data.frame(High_in_ambient=rowData(sce)$high_in_ambient))
+## Sort 
+dec.pois = dec.pois[order(dec.pois$bio, decreasing=TRUE),]
+
+# Highly variable gene
+## Extract HVGs (significant ones with remaining variance > 0.3 & FDR<1%)
+hvg.out =  getTopHVGs(dec.pois,fdr.threshold=0.05, var.threshold=0.1) 
+
+# remove the genes, that are high variable and high in the ambient
+hvg.out = hvg.out[!hvg.out %in% row.names(sce)[rowData(sce)$high_in_ambient == TRUE]]
+
+# PCA 
+set.seed(1000)
+sce = runPCA(sce, subset_row=hvg.out)
+# Denoise the PCA 
+set.seed(1000)
+sce = denoisePCA(sce, technical=rowData(sce)$decomposeVar, subset.row=hvg.out)
+
+```
+
+
+
+# Correcting batch effects
+
+```{r batch_correction, echo=FALSE}
+## MNN correction
+set.seed(1234)
+mnn.out = fastMNN(sce, batch=sce$batch_full_info, d=50, k=50, subset.row=hvg.out,
+                   BSPARAM=BiocSingular::RandomParam(deferred=TRUE))
+
+# runTSNE and UMAP on corrected PCA
+bpPar = MulticoreParam(workers = 4, RNGseed = 1234)
+mnn.out = runTSNE(mnn.out, dimred="corrected",BPPARAM = bpPar)
+mnn.out = runUMAP(mnn.out, dimred="corrected",BPPARAM = bpPar)
+
+## Add corrected PCA/TSNE/UMAP to sce object
+reducedDim(sce, "MNN_Sample_k50") <- reducedDim(mnn.out, "corrected")
+reducedDim(sce, "TSNE_MNN_Sample_k50") <- reducedDim(mnn.out, "TSNE")
+reducedDim(sce, "UMAP_MNN_Sample_k50") <- reducedDim(mnn.out, "UMAP")
+
+```
+
+
+# Doublet removal
+
+```{r doublet_removal, echo=F}
+# remove all cells annotated as doublet (scDblFinder) 
+sce = sce[,-which(sce$scDblFinder$scDblFinder.class=='doublet')] # 4508 doublet
+```
+
+# Cell cycle assignment
+
+```{r Cyclone, echo=FALSE}
+# Using the cyclone() classifier
+## reference dataset
+mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
+set.seed(100)
+assignments <- cyclone(sce, mm.pairs, gene.names=rowData(sce)$GENEID, verbose=T, 
+                      BPPARAM=BiocParallel::MulticoreParam(4)) 
+
+# Add info into sce object: 
+sce$phases <- assignments$phases
+```
+
+
+
+# Clustering
+
+main clustering and sub-clustering of cluster 0
+
+```{r clustering, echo=FALSE}
+## Main clustering
+# convert sce to seurat object
+sce.Seurat = sce
+sce.Seurat = removeAltExps(sce.Seurat) 
+rownames(sce.Seurat) = rowData(sce.Seurat)$GENEID
+reducedDims(sce.Seurat) = reducedDims(sce.Seurat)[c('MNN_Sample_k50','TSNE_MNN_Sample_k50','UMAP_MNN_Sample_k50')]
+reducedDim(sce.Seurat,'pca') = reducedDim(sce.Seurat,'MNN_Sample_k50') 
+reducedDims(sce.Seurat) = reducedDims(sce.Seurat)[c('pca')]
+sce.Seurat = as.Seurat(sce.Seurat)
+
+# Find cluster using seurat
+set.seed(1234)
+# k.param nearest neighbors
+sce.Seurat = FindNeighbors(sce.Seurat, dims = 1:20)
+# Use knn graph to construct the SNN graph by calculating the neighborhood overlap
+sce.Seurat = FindClusters(sce.Seurat, resolution = 0.6)
+# add clustering to sce object: 
+sce$seurat_res0.6 = Idents(sce.Seurat)
+
+
+## Sub-clustering cluster 0
+# subset the dataset
+sce_cluster_2 = sce[,which(sce$seurat_res0.6=='0')]
+# Feature selection
+set.seed(100)
+dec.pois.sce2 = modelGeneVarByPoisson(sce_cluster_2)
+## Store it 
+rowData(sce_cluster_2)$decomposeVar = dec.pois.sce2
+## Sort it
+dec.pois.sce2 = dec.pois.sce2[order(dec.pois.sce2$bio, decreasing=TRUE),]
+# define HVG for the subset
+hvg.out.sce2 = getTopHVGs(dec.pois.sce2,fdr.threshold=0.05, var.threshold=0.1) # first by default= top2000. 
+# Rerunning PCA using HVGs only
+set.seed(1000)
+sce_cluster_2 = runPCA(sce_cluster_2, subset_row=hvg.out.sce2)
+# Denoise PCA
+set.seed(1000)
+sce_cluster_2 = denoisePCA(sce_cluster_2, technical=rowData(sce_cluster_2)$decomposeVar, subset.row=hvg.out.sce2)
+# New batch correction
+set.seed(1234)
+mnn.out <- fastMNN(sce_cluster_2, 
+                   batch=sce_cluster_2$batch_full_info, d=50, k=50, 
+                   subset.row=hvg.out.sce2,
+                   BSPARAM=BiocSingular::RandomParam(deferred=TRUE))
+
+# TSNE AND UMAP
+bpPar = MulticoreParam(workers = 4, RNGseed = 1234)
+mnn.out = runTSNE(mnn.out, dimred="corrected",BPPARAM = bpPar)
+mnn.out = runUMAP(mnn.out, dimred="corrected",BPPARAM = bpPar)
+# Add to sce object
+reducedDim(sce_cluster_2, "MNN_Sample_k50") <- reducedDim(mnn.out, "corrected")
+reducedDim(sce_cluster_2, "TSNE_MNN_Sample_k50") <- reducedDim(mnn.out, "TSNE")
+reducedDim(sce_cluster_2, "UMAP_MNN_Sample_k50") <- reducedDim(mnn.out, "UMAP")
+
+
+# Clustering
+sce.Seurat.subset = sce_cluster_2
+sce.Seurat.subset = removeAltExps(sce.Seurat.subset) 
+rownames(sce.Seurat.subset) = rowData(sce.Seurat.subset)$GENEID
+reducedDim(sce.Seurat.subset) = reducedDim(sce.Seurat.subset,'MNN_Sample_k50') 
+sce.Seurat.subset = as.Seurat(sce.Seurat.subset)
+
+# Find cluster using seurat 
+set.seed(1234)
+sce.Seurat.subset <- FindNeighbors(sce.Seurat.subset, dims = 1:20)
+sce.Seurat.subset <- FindClusters(sce.Seurat.subset, resolution = 0.3) 
+# Seurat cluster identities
+sce_cluster_2$clustering_fine_0.3 = as.factor(Idents(sce.Seurat.subset))
+
+## Combine main and sub clusters: 
+sce_cluster_2$clustering_fine_0.3 = as.character(sce_cluster_2$clustering_fine_0.3)
+sce_cluster_2$clustering_fine_0.3[which(sce_cluster_2$clustering_fine_0.3=='0')] = '0.0'
+sce_cluster_2$clustering_fine_0.3[which(sce_cluster_2$clustering_fine_0.3=='1')] = '0.1'
+sce_cluster_2$clustering_fine_0.3[which(sce_cluster_2$clustering_fine_0.3=='2')] = '0.2'
+
+combined_clustering = as.character(sce$seurat_res0.6)
+names(combined_clustering) = colnames(sce)
+combined_clustering[colnames(sce_cluster_2)] = sce_cluster_2$clustering_fine_0.3
+sce$combined_clustering = combined_clustering
+sce$combined_clustering = as.factor(sce$combined_clustering)
+```
+
+
+
+
+# Cell type annotation
+
+Using existing references
+
+```{r cell_annotation, echo=FALSE}
+# Prepare reference dataset (Fast et al. 2021)
+mat = fread("exprMatrix.tsv.gz") # We asked the autors for the processed table
+meta = read.table("meta.tsv", header=T, sep="\t", as.is=T, row.names=1)
+genes = mat[,1][[1]]
+genes = gsub(".+[|]", "", genes)
+mat = data.frame(mat[,-1], row.names=genes)
+colnames(mat) = gsub('.','-',colnames(mat),fixed = T)
+so = CreateSeuratObject(counts = mat, project = "myProjectName", meta.data=meta)
+sce_fast = as.SingleCellExperiment(so)
+table(rownames(sce_fast)%in%rownames(sce))
+assays(sce_fast) = assays(sce_fast)['logcounts']
+
+# run singleR on Fast Louvain.Cluste annotation
+pred_fast = SingleR(test = sce, ref = sce_fast, labels = sce_fast$Louvain.Cluster)
+# add to single cell object
+sce$cell_type_fast_Louvain_Cluster = toupper(as.character(pred_fast$pruned.labels)) 
+# run singleR on Fast surface marker annotation
+pred_fast2 <- SingleR(test = sce, ref = sce_fast, labels = sce_fast$surface_marker)
+# add to single cell object
+sce$cell_type_fast_surface_marker <- toupper(as.character(pred_fast2$pruned.labels)) 
+
+```
+
+
+
+# Integrating with protein abundance 
+
+Gating stategy (Fast et al. 2021). See material and method for details
+
+```{r gating}
+
+## CD34
+# Positive and negative to CD34
+adt_cd34 = adt_matrix[which( adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] < 8),'CD34'] # binomial distribution
+
+cut_30 = sort(adt_cd34,decreasing = F)[round(length(adt_cd34)/100*20)]
+negativ = which(adt_cd34 < cut_30)
+positiv = which(adt_cd34 >= cut_30)
+
+
+gating_fast_LTHSC =  rownames(adt_matrix)[which( adt_matrix[,'CD34'] < cut_30 & adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] < 8)] # 753 (0.72%)
+gating_fast_MPP1 = rownames(adt_matrix)[which( adt_matrix[,'CD34'] >= cut_30 & adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] < 8)] # 3.3
+gating_fast_MPP2 =  rownames(adt_matrix)[which( adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] > 8)] # 10%
+gating_fast_MPP34 =  rownames(adt_matrix)[which( adt_matrix[,'CD150'] < 5.5 & adt_matrix[,'CD48'] > 8)] # 43%
+gating_fast_MPP0 =  rownames(adt_matrix)[which( adt_matrix[,'CD150'] < 5.5 & adt_matrix[,'CD48'] < 8)] # 10%
+
+
+sce$gating_fast = 'no_gate'
+sce$gating_fast[which(colnames(sce)%in%gating_fast_LTHSC)] = 'LTHSC'
+sce$gating_fast[which(colnames(sce)%in%gating_fast_MPP1)] = 'STHSC'
+sce$gating_fast[which(colnames(sce)%in%gating_fast_MPP2)] = 'MPP2'
+sce$gating_fast[which(colnames(sce)%in%gating_fast_MPP34)] = 'MPP3'
+sce$gating_fast[which(colnames(sce)%in%gating_fast_MPP0)] = 'MPP0'
+
+
+# color accorinding to annotation
+color_vector = sce$gating_fast
+color_vector[which(color_vector=='MPP2')] = "#4363d8" 
+color_vector[which(color_vector=='MPP3')] = "#3cb44b" 
+color_vector[which(color_vector=='no_gate')] = "grey90" 
+color_vector[which(color_vector=='LTHSC')] = "#e6194b"
+color_vector[which(color_vector=='STHSC')] = "#f58231"
+color_vector[which(color_vector=='MPP0')] = "#e5f531"
+
+```
+
+
+# Cluster filtering
+
+Cluster 17, 18 and 19 were removed from the dataset prior to differential expression analysis (see material and method)
+
+```{r filtering, echo=FALSE}
+sce = sce[,-which(sce$final_clustering%in%c('17','18','19'))]
+```
+
+# Differential analysis
+
+Pseudo-bulk analysis for each the cluster
+
+```{r Differential_expression, echo=FALSE}
+# Pseudo-replicate for pseudo-bulk analysis
+sce$full_info_rev = paste0(sce$day,'_',sce$condition,'_',sce$batchNr)
+# Rename clusters 0 to 9
+sce$combined_clustering = paste('clust',sce$combined_clustering ,sep='')
+sce$combined_clustering[which(sce$combined_clustering=='clust0.0')] = 'clust000'
+sce$combined_clustering[which(sce$combined_clustering=='clust0.1')] = 'clust001'
+sce$combined_clustering[which(sce$combined_clustering=='clust0.2')] = 'clust002'
+sce$combined_clustering[which(sce$combined_clustering=='clust1')] = 'clust01'
+sce$combined_clustering[which(sce$combined_clustering=='clust2')] = 'clust02'
+sce$combined_clustering[which(sce$combined_clustering=='clust3')] = 'clust03'
+sce$combined_clustering[which(sce$combined_clustering=='clust4')] = 'clust04'
+sce$combined_clustering[which(sce$combined_clustering=='clust5')] = 'clust05'
+sce$combined_clustering[which(sce$combined_clustering=='clust6')] = 'clust06'
+sce$combined_clustering[which(sce$combined_clustering=='clust7')] = 'clust07'
+sce$combined_clustering[which(sce$combined_clustering=='clust8')] = 'clust08'
+sce$combined_clustering[which(sce$combined_clustering=='clust9')] = 'clust09'
+
+
+
+splitCells = factor(paste0(make.names(sce$combined_clustering), ".", sce$full_info_rev))
+num_cells <- table(splitCells)
+
+# Filter: Exlude condition with less than 20 cell per samples
+excludedCluster = names(num_cells[num_cells < 20]) 
+sce.cell = sce[,-which(splitCells%in%excludedCluster)]
+splitCells <- factor(paste0(make.names(sce.cell$combined_clustering), ".", sce.cell$full_info_rev))
+# number of cells per samples and condition
+num_cells <- table(splitCells)
+
+
+## Sum of all cell from each sample
+sum_by_cluster <- vapply(split(colnames(sce.cell), splitCells), function(x){ Matrix::rowSums(counts(sce.cell)[, x]) }, numeric(length = nrow(counts(sce.cell)))) 
+
+
+# Create data frame containing information about the samples 
+pheno <- data.frame(summed_sample=colnames(sum_by_cluster))
+row.names(pheno) <- pheno$summed_sample
+pheno$num_cells <- num_cells
+pheno.comp = pheno
+clu.day = unlist(lapply(pheno$summed_sample, function(x) strsplit(x,'_')[[1]][1]))
+# cluster 
+pheno.comp$clu = unlist(lapply(pheno$summed_sample, function(x) strsplit(x,'.',fixed = T)[[1]][1]))
+# sample name
+pheno.comp$sam = unlist(lapply(pheno$summed_sample, function(x) strsplit(x,'.',fixed = T)[[1]][2]))
+# day 
+pheno.comp$day = unlist(lapply(pheno.comp$sam, function(x) strsplit(x,'_',fixed=T)[[1]][1]))
+# treatment
+pheno.comp$tpo = unlist(lapply(pheno.comp$sam, function(x) strsplit(x,'_',fixed=T)[[1]][2]))
+# fusion/no fusion
+pheno.comp$fusion =unlist(lapply(pheno.comp$sam, function(x) strsplit(x,'_',fixed=T)[[1]][3]))
+# full condition: day + treatment + fusion
+pheno.comp$condition = paste(pheno.comp$day,pheno.comp$tpo,pheno.comp$fusion,sep='_')
+# Add these info to final data frame
+pheno$cluster <- factor(pheno.comp$clu)
+pheno$replicate <- factor(pheno.comp$sam)
+pheno$condition <- factor(pheno.comp$condition)
+
+```
+
+```{r DGEList, echo=FALSE}
+## Create DGEList object 
+# Create unique row names
+row.names(sum_by_cluster) = uniquifyFeatureNames(rowData(sce)$GENEID, rowData(sce)$SYMBOL)
+# combine info into dgelist
+dge = DGEList(counts=sum_by_cluster,
+             group=factor(paste(pheno$cluster, pheno$condition, sep=".")),
+             samples=pheno,
+             genes=as.data.frame(rowData(sce.cell)[, c('GENEID','SYMBOL','ENTREZID','uniqueSymbol','DESCRIPTION')]), 
+             remove.zeros=FALSE)
+
+# calculate normalization factors
+dge = calcNormFactors(dge)
+
+## Gene filtering
+# Keep only the genes that are expressed in at least 2 samples
+keep = rowSums(edgeR::cpm(dge) > 1) >= 2
+# Subset, while updating total counts
+dge = dge[keep, , keep.lib.sizes=FALSE] 
+# Redo normalization (TMM)
+dge = calcNormFactors(dge) 
+# Clean-up 
+row.names(dge) = dge$genes$GENEID 
+# keep only most informative information
+dge$genes = dge$genes[, c(1, 4, 3, 5)]
+names(dge$genes) = c("GENEID", "SYMBOL", "ENTREZID", "DESCRIPTION")
+# Visualize CPM after filtering
+log2cpm.raw = edgeR::cpm(dge, log=TRUE, prior.count=8, normalized.lib.sizes=FALSE)
+# and after TMM normalization
+log2cpm = edgeR::cpm(dge, log=TRUE, prior.count=8, normalized.lib.sizes=TRUE) 
+
+
+## design matrix 
+moma = model.matrix(~ 0 + group, data=dge$samples) 
+colnames(moma) = gsub("group", "", colnames(moma)) 
+colnames(moma) = make.names(colnames(moma))
+
+# Contrast matrix: cluster 0.02 can only be assessed for day2 (not enough replicate at day5)
+contrasts.matrix <- makeContrasts(
+  
+  # cluster 000: 
+  clust000.fusion.day2 = clust000.day2_TPO_FUSION - clust000.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust000.nofusion.day2 = clust000.day2_TPO_noFUSION - clust000.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust000.tpo.day2  = clust000.day2_TPO_FUSION - clust000.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust000.pbs.day2  = clust000.day2_PBS_FUSION - clust000.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # cluster 001: 
+  clust001.fusion.day2 = clust001.day2_TPO_FUSION - clust001.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust001.nofusion.day2 = clust001.day2_TPO_noFUSION - clust001.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust001.tpo.day2  = clust001.day2_TPO_FUSION - clust001.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust001.pbs.day2  = clust001.day2_PBS_FUSION - clust001.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # cluster 002: 
+  clust002.fusion.day2 = clust002.day2_TPO_FUSION - clust002.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust002.nofusion.day2 = clust002.day2_TPO_noFUSION - clust002.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust002.tpo.day2  = clust002.day2_TPO_FUSION - clust002.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust002.pbs.day2  = clust002.day2_PBS_FUSION - clust002.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+
+  # clust01: 
+  clust01.fusion.day2 = clust01.day2_TPO_FUSION - clust01.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust01.nofusion.day2 = clust01.day2_TPO_noFUSION - clust01.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust01.tpo.day2  = clust01.day2_TPO_FUSION - clust01.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust01.pbs.day2  = clust01.day2_PBS_FUSION - clust01.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust02: 
+  clust02.fusion.day2 = clust02.day2_TPO_FUSION - clust02.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust02.nofusion.day2 = clust02.day2_TPO_noFUSION - clust02.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust02.tpo.day2  = clust02.day2_TPO_FUSION - clust02.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust02.pbs.day2  = clust02.day2_PBS_FUSION - clust02.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust03: 
+  clust03.fusion.day2 = clust03.day2_TPO_FUSION - clust03.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust03.nofusion.day2 = clust03.day2_TPO_noFUSION - clust03.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust03.tpo.day2  = clust03.day2_TPO_FUSION - clust03.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust03.pbs.day2  = clust03.day2_PBS_FUSION - clust03.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust04: 
+  clust04.fusion.day2 = clust04.day2_TPO_FUSION - clust04.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust04.nofusion.day2 = clust04.day2_TPO_noFUSION - clust04.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust04.tpo.day2  = clust04.day2_TPO_FUSION - clust04.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust04.pbs.day2  = clust04.day2_PBS_FUSION - clust04.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+    
+  # clust05: 
+  clust05.fusion.day2 = clust05.day2_TPO_FUSION - clust05.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust05.nofusion.day2 = clust05.day2_TPO_noFUSION - clust05.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust05.tpo.day2  = clust05.day2_TPO_FUSION - clust05.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust05.pbs.day2  = clust05.day2_PBS_FUSION - clust05.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust06: 
+  clust06.fusion.day2 = clust06.day2_TPO_FUSION - clust06.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust06.nofusion.day2 = clust06.day2_TPO_noFUSION - clust06.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust06.tpo.day2  = clust06.day2_TPO_FUSION - clust06.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust06.pbs.day2  = clust06.day2_PBS_FUSION - clust06.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust07: 
+  clust07.fusion.day2 = clust07.day2_TPO_FUSION - clust07.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust07.nofusion.day2 = clust07.day2_TPO_noFUSION - clust07.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust07.tpo.day2  = clust07.day2_TPO_FUSION - clust07.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust07.pbs.day2  = clust07.day2_PBS_FUSION - clust07.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust08: 
+  clust08.fusion.day2 = clust08.day2_TPO_FUSION - clust08.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust08.nofusion.day2 = clust08.day2_TPO_noFUSION - clust08.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust08.tpo.day2  = clust08.day2_TPO_FUSION - clust08.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust08.pbs.day2  = clust08.day2_PBS_FUSION - clust08.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust09: 
+  clust09.fusion.day2 = clust09.day2_TPO_FUSION - clust09.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust09.nofusion.day2 = clust09.day2_TPO_noFUSION - clust09.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust09.tpo.day2  = clust09.day2_TPO_FUSION - clust09.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust09.pbs.day2  = clust09.day2_PBS_FUSION - clust09.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust10: 
+  clust10.fusion.day2 = clust10.day2_TPO_FUSION - clust10.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust10.nofusion.day2 = clust10.day2_TPO_noFUSION - clust10.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust10.tpo.day2  = clust10.day2_TPO_FUSION - clust10.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust10.pbs.day2  = clust10.day2_PBS_FUSION - clust10.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust11: 
+  clust11.fusion.day2 = clust11.day2_TPO_FUSION - clust11.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust11.nofusion.day2 = clust11.day2_TPO_noFUSION - clust11.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust11.tpo.day2  = clust11.day2_TPO_FUSION - clust11.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust11.pbs.day2  = clust11.day2_PBS_FUSION - clust11.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust12: 
+  clust12.fusion.day2 = clust12.day2_TPO_FUSION - clust12.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust12.nofusion.day2 = clust12.day2_TPO_noFUSION - clust12.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust12.tpo.day2  = clust12.day2_TPO_FUSION - clust12.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust12.pbs.day2  = clust12.day2_PBS_FUSION - clust12.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust13: 
+  clust13.fusion.day2 = clust13.day2_TPO_FUSION - clust13.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust13.nofusion.day2 = clust13.day2_TPO_noFUSION - clust13.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust13.tpo.day2  = clust13.day2_TPO_FUSION - clust13.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust13.pbs.day2  = clust13.day2_PBS_FUSION - clust13.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust14: 
+  clust14.fusion.day2 = clust14.day2_TPO_FUSION - clust14.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust14.nofusion.day2 = clust14.day2_TPO_noFUSION - clust14.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust14.tpo.day2  = clust14.day2_TPO_FUSION - clust14.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust14.pbs.day2  = clust14.day2_PBS_FUSION - clust14.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust15: 
+  clust15.fusion.day2 = clust15.day2_TPO_FUSION - clust15.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust15.nofusion.day2 = clust15.day2_TPO_noFUSION - clust15.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust15.tpo.day2  = clust15.day2_TPO_FUSION - clust15.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust15.pbs.day2  = clust15.day2_PBS_FUSION - clust15.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust16: 
+  clust16.fusion.day2 = clust16.day2_TPO_FUSION - clust16.day2_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust16.nofusion.day2 = clust16.day2_TPO_noFUSION - clust16.day2_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust16.tpo.day2  = clust16.day2_TPO_FUSION - clust16.day2_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust16.pbs.day2  = clust16.day2_PBS_FUSION - clust16.day2_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+    
+  # cluster 000: 
+  clust000.fusion.day5 = clust000.day5_TPO_FUSION - clust000.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust000.nofusion.day5 = clust000.day5_TPO_noFUSION - clust000.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust000.tpo.day5  = clust000.day5_TPO_FUSION - clust000.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust000.pbs.day5  = clust000.day5_PBS_FUSION - clust000.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # cluster 001: 
+  clust001.fusion.day5 = clust001.day5_TPO_FUSION - clust001.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust001.nofusion.day5 = clust001.day5_TPO_noFUSION - clust001.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust001.tpo.day5  = clust001.day5_TPO_FUSION - clust001.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust001.pbs.day5  = clust001.day5_PBS_FUSION - clust001.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+
+  # clust01: 
+  clust01.fusion.day5 = clust01.day5_TPO_FUSION - clust01.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust01.nofusion.day5 = clust01.day5_TPO_noFUSION - clust01.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust01.tpo.day5  = clust01.day5_TPO_FUSION - clust01.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust01.pbs.day5  = clust01.day5_PBS_FUSION - clust01.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust02: 
+  clust02.fusion.day5 = clust02.day5_TPO_FUSION - clust02.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust02.nofusion.day5 = clust02.day5_TPO_noFUSION - clust02.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust02.tpo.day5  = clust02.day5_TPO_FUSION - clust02.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust02.pbs.day5  = clust02.day5_PBS_FUSION - clust02.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust03: 
+  clust03.fusion.day5 = clust03.day5_TPO_FUSION - clust03.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust03.nofusion.day5 = clust03.day5_TPO_noFUSION - clust03.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust03.tpo.day5  = clust03.day5_TPO_FUSION - clust03.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust03.pbs.day5  = clust03.day5_PBS_FUSION - clust03.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust04: 
+  clust04.fusion.day5 = clust04.day5_TPO_FUSION - clust04.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust04.nofusion.day5 = clust04.day5_TPO_noFUSION - clust04.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust04.tpo.day5  = clust04.day5_TPO_FUSION - clust04.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust04.pbs.day5  = clust04.day5_PBS_FUSION - clust04.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+    
+  # clust05: 
+  clust05.fusion.day5 = clust05.day5_TPO_FUSION - clust05.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust05.nofusion.day5 = clust05.day5_TPO_noFUSION - clust05.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust05.tpo.day5  = clust05.day5_TPO_FUSION - clust05.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust05.pbs.day5  = clust05.day5_PBS_FUSION - clust05.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust06: 
+  clust06.fusion.day5 = clust06.day5_TPO_FUSION - clust06.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust06.nofusion.day5 = clust06.day5_TPO_noFUSION - clust06.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust06.tpo.day5  = clust06.day5_TPO_FUSION - clust06.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust06.pbs.day5  = clust06.day5_PBS_FUSION - clust06.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust07: 
+  clust07.fusion.day5 = clust07.day5_TPO_FUSION - clust07.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust07.nofusion.day5 = clust07.day5_TPO_noFUSION - clust07.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust07.tpo.day5  = clust07.day5_TPO_FUSION - clust07.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust07.pbs.day5  = clust07.day5_PBS_FUSION - clust07.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust08: 
+  clust08.fusion.day5 = clust08.day5_TPO_FUSION - clust08.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust08.nofusion.day5 = clust08.day5_TPO_noFUSION - clust08.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust08.tpo.day5  = clust08.day5_TPO_FUSION - clust08.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust08.pbs.day5  = clust08.day5_PBS_FUSION - clust08.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust09: 
+  clust09.fusion.day5 = clust09.day5_TPO_FUSION - clust09.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust09.nofusion.day5 = clust09.day5_TPO_noFUSION - clust09.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust09.tpo.day5  = clust09.day5_TPO_FUSION - clust09.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust09.pbs.day5  = clust09.day5_PBS_FUSION - clust09.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust10: 
+  clust10.fusion.day5 = clust10.day5_TPO_FUSION - clust10.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust10.nofusion.day5 = clust10.day5_TPO_noFUSION - clust10.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust10.tpo.day5  = clust10.day5_TPO_FUSION - clust10.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust10.pbs.day5  = clust10.day5_PBS_FUSION - clust10.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+     
+  # clust11: 
+  clust11.fusion.day5 = clust11.day5_TPO_FUSION - clust11.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust11.nofusion.day5 = clust11.day5_TPO_noFUSION - clust11.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust11.tpo.day5  = clust11.day5_TPO_FUSION - clust11.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust11.pbs.day5  = clust11.day5_PBS_FUSION - clust11.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust12: 
+  clust12.fusion.day5 = clust12.day5_TPO_FUSION - clust12.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust12.nofusion.day5 = clust12.day5_TPO_noFUSION - clust12.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust12.tpo.day5  = clust12.day5_TPO_FUSION - clust12.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust12.pbs.day5  = clust12.day5_PBS_FUSION - clust12.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust13: 
+  clust13.fusion.day5 = clust13.day5_TPO_FUSION - clust13.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust13.nofusion.day5 = clust13.day5_TPO_noFUSION - clust13.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust13.tpo.day5  = clust13.day5_TPO_FUSION - clust13.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust13.pbs.day5  = clust13.day5_PBS_FUSION - clust13.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust14: 
+  clust14.fusion.day5 = clust14.day5_TPO_FUSION - clust14.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust14.nofusion.day5 = clust14.day5_TPO_noFUSION - clust14.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust14.tpo.day5  = clust14.day5_TPO_FUSION - clust14.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust14.pbs.day5  = clust14.day5_PBS_FUSION - clust14.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust15: 
+  clust15.fusion.day5 = clust15.day5_TPO_FUSION - clust15.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust15.nofusion.day5 = clust15.day5_TPO_noFUSION - clust15.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust15.tpo.day5  = clust15.day5_TPO_FUSION - clust15.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust15.pbs.day5  = clust15.day5_PBS_FUSION - clust15.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+  # clust16: 
+  clust16.fusion.day5 = clust16.day5_TPO_FUSION - clust16.day5_PBS_FUSION, # TPO vs. PBS when fusion (overexpression in TPO)
+  clust16.nofusion.day5 = clust16.day5_TPO_noFUSION - clust16.day5_PBS_noFUSION, # TPO vs. PBS when no fusion (overexpression in TPO)
+  clust16.tpo.day5  = clust16.day5_TPO_FUSION - clust16.day5_TPO_noFUSION, # fusion vs no fusion when under TPO (overexpression in fusion)
+  clust16.pbs.day5  = clust16.day5_PBS_FUSION - clust16.day5_PBS_noFUSION, # fusion vs no fusion when under PBS(overexpression in fusion)
+  
+ levels=moma
+)
+
+
+
+## Differential expression test per cluster
+
+# save the results of DE in list
+fits <- list()
+
+# Loop across the contrast
+for (i in 1:ncol(contrasts.matrix)) {
+  
+  # Name of the constrast
+  contr.name <- colnames(contrasts.matrix)[i]
+  
+  # Print info
+  message("   Working on ... ", contr.name)
+  
+  # Subset samples
+  dge.temp <- dge[, dge$samples$group %in% names(which(contrasts.matrix[,i] != 0))]
+  
+  ## Subset and renormalize
+  keep <- rowSums(edgeR::cpm(dge.temp) > 1) >= 2  
+  dge.temp <- dge.temp[keep, , keep.lib.sizes=FALSE] 
+  
+  ## Add a filtering step on the min number of cells with expression!
+  ## keep only the cell belonging to the contrast we are making
+  sce.temp <- 
+    sce[
+      rowData(sce)$GENEID %in% dge.temp$genes$GENEID, 
+      paste0(sce$combined_clustering, ".",sce$day,'_', sce$TPO,'_',sce$Fusion) %in% names(which(contrasts.matrix[,i] != 0)) ]
+  
+  ## Should be detected in at least 5% of the cells
+  keep <- rowSums(counts(sce.temp) > 0 ) > dim(sce.temp)[2]/100*5
+  dge.temp <- dge.temp[keep, , keep.lib.sizes=FALSE] 
+  
+  # print(dim(dge.temp)) # total 5568 genes for MF9_d60.clust10vs1
+  
+  ## Redo TMM normalization
+  dge.temp <- calcNormFactors(dge.temp) 
+  ## After TMM normalization
+  log2cpm.temp <- edgeR::cpm(dge.temp, log=TRUE, prior.count=8, normalized.lib.sizes=TRUE)
+
+
+  ## design matrix 
+  moma.temp <- model.matrix(~ 0 + group, data=dge.temp$samples) 
+  colnames(moma.temp) <- gsub("group", "", colnames(moma.temp)) 
+  colnames(moma.temp) <- make.names(colnames(moma.temp))
+  colnames(moma.temp)
+  
+  ## estimate dispersion (TMM norm object)
+  dge.temp <- estimateDisp(dge.temp, moma.temp)
+
+  fit1 <- glmFit(dge.temp, moma.temp, prior.count=8) 
+  lrt <- glmLRT(fit1, contrast=contrasts.matrix[names(which(contrasts.matrix[,i] != 0)), i])
+
+
+  ## add results to list
+  fits[[contr.name]] <- lrt
+  rm(lrt)
+  
+  ## Save filtered DGEList and other info useful for later 
+  fits[[contr.name]]$dge <- dge.temp
+  fits[[contr.name]]$moma <- moma.temp
+
+}
+
+
+```
+
+
+
+# Figure
+
+```{r}
+# final figure
+myTheme =  theme_bw(base_size = 20) + 
+  theme(panel.grid.major = element_line(colour = "lightgrey", linewidth = 0.1))  +
+  theme(axis.text=element_text(size=20))
+
+sce$cell_type_fast_Louvain_Cluster = str_replace(sce$cell_type_fast_Louvain_Cluster ,'LSK-','')
+
+a = plotReducedDim(sce, dimred="TSNE_MNN_Sample_k50", colour_by="final_clustering" ) + myTheme + xlab('TSNE.1') + ylab('TSNE.2') + coord_fixed( ) 
+
+b = plotReducedDim(sce, dimred="TSNE_MNN_Sample_k50", colour_by="cell_type_fast_Louvain_Cluster" )+  scale_color_manual(name = "",values=c('PRIMITIVE'='#296DA0','PRIMED'='#ADB55F','METABOLISM'='#259461','CELL-CYCLE'='#7E5146','INTERFERON CELL-CYCLE'='#C971A1','INTERFERON'='#795291','ACUTE-ACTIVATION'='#C32B2C','MYELOID'='#31B6BF'))  + myTheme + xlab('TSNE.1') + ylab('TSNE.2' ) + coord_fixed( ) 
+
+c = plotReducedDim(sce, dimred="TSNE_MNN_Sample_k50", colour_by="phases" ) + myTheme + xlab('TSNE.1') + ylab('TSNE.2') + coord_fixed( ) 
+
+
+colors = c (LTHSC="#e6194b",MPP0= "grey90",STHSC="grey90",MPP2="grey90",MPP3="grey90" ,no_gate='grey90')
+LTHSC = plotReducedDim(sce[,which(sce$gating_fast=='LTHSC')], dimred="TSNE_MNN_Sample_k50", colour_by="gating_fast", size_by='gating_fast',shape_by = 'gating_fast') +  myTheme + coord_fixed( ) +
+  scale_color_manual(name = "gating_fast",values=colors) + scale_size_manual(name = "gating_fast",values=c (LTHSC=1,MPP0= 0.01,STHSC=0.1,MPP2=0.01,MPP3=0.01 ,no_gate=0.01)) +  scale_shape_manual(name = "gating_fast",values=c (LTHSC=16,MPP0= 16,STHSC=16,MPP2=16,MPP3=16 ,no_gate=16)) + geom_density_2d(color='grey80') + xlab('TSNE.1') + ylab('TSNE.2') 
+
+
+colors = c (LTHSC="grey90",MPP0 ="#e5f531",STHSC="grey90",MPP2="grey90",MPP3="grey90" ,no_gate='grey90')
+MPP0 =plotReducedDim(sce[,which(sce$gating_fast=='MPP0')], dimred="TSNE_MNN_Sample_k50", colour_by="gating_fast", size_by='gating_fast',shape_by = 'gating_fast') +  myTheme + coord_fixed( ) +
+  scale_color_manual(name = "gating_fast",values=colors) + scale_size_manual(name = "gating_fast",values=c (LTHSC=0.01,MPP0= 1,STHSC=0.1,MPP2=0.01,MPP3=0.01 ,no_gate=0.01)) +  scale_shape_manual(name = "gating_fast",values=c (LTHSC=16,MPP0= 16,STHSC=16,MPP2=16,MPP3=16 ,no_gate=16)) + geom_density_2d(color='grey80') + xlab('TSNE.1') + ylab('TSNE.2')
+
+colors = c (LTHSC="grey90",MPP0= "grey90",STHSC="#f58231",MPP2="grey90",MPP3="grey90" ,no_gate='grey90')
+STHSC = plotReducedDim(sce[,which(sce$gating_fast=='STHSC')], dimred="TSNE_MNN_Sample_k50", colour_by="gating_fast", size_by='gating_fast',shape_by = 'gating_fast') +  myTheme + coord_fixed( ) +
+  scale_color_manual(name = "gating_fast",values=colors) + scale_size_manual(name = "gating_fast",values=c (LTHSC=0.01,MPP0= 0.01,STHSC=1,MPP2=0.01,MPP3=0.01 ,no_gate=0.01)) +  scale_shape_manual(name = "gating_fast",values=c (LTHSC=16,MPP0= 16,STHSC=16,MPP2=16,MPP3=16 ,no_gate=16)) + geom_density_2d(color='grey80') + xlab('TSNE.1') + ylab('TSNE.2')
+
+colors = c (LTHSC="grey90",MPP0= "grey90",STHSC="grey90",MPP2="#4363d8",MPP3="grey90" ,no_gate='grey90')
+MPP2 = plotReducedDim(sce[,which(sce$gating_fast=='MPP2')], dimred="TSNE_MNN_Sample_k50", colour_by="gating_fast", size_by='gating_fast',shape_by = 'gating_fast') +  myTheme + coord_fixed( ) +
+  scale_color_manual(name = "gating_fast",values=colors) + scale_size_manual(name = "gating_fast",values=c (LTHSC=0.01,MPP0= 0.01,STHSC=0.01,MPP2=1,MPP3=0.01 ,no_gate=0.01))  +  scale_shape_manual(name = "gating_fast",values=c (LTHSC=16,MPP0= 16,STHSC=16,MPP2=16,MPP3=16 ,no_gate=16)) + geom_density_2d(color='grey80') + xlab('TSNE.1') + ylab('TSNE.2')
+
+
+colors = c (LTHSC="grey90",MPP0= "grey90",STHSC="grey90",MPP2="grey90",MPP3="#3cb44b" ,no_gate='grey90')
+MPP3 = plotReducedDim(sce[,which(sce$gating_fast=='MPP3')], dimred="TSNE_MNN_Sample_k50", colour_by="gating_fast", size_by='gating_fast',shape_by = 'gating_fast') +  myTheme + coord_fixed( ) +
+  scale_color_manual(name = "gating_fast",values=colors) + scale_size_manual(name = "gating_fast",values=c (LTHSC=0.01,MPP0= 0.01,STHSC=0.01,MPP2=0.01,MPP3=1 ,no_gate=0.01))  +  scale_shape_manual(name = "gating_fast",values=c (LTHSC=16,MPP0= 16,STHSC=16,MPP2=16,MPP3=16 ,no_gate=16)) + geom_density_2d(color='grey80') + xlab('TSNE.1') + ylab('TSNE.2')
+
+```
