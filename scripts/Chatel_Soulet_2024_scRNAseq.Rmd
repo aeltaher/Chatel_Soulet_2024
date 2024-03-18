@@ -18,11 +18,10 @@ knitr::opts_chunk$set(echo     = TRUE,
 
 # Environnement
 
+Analysis done within R v4.2.0 and Bioconductor v3.15
+
 ```{r library, echo=FALSE}
-
-# Analysis done within R v4.2.0 and Bioconductor v3.15
-
-## Single cell analysis
+## All libraries
 library(SingleCellExperiment) # v.1.18.0
 library(scuttle) # v.1.6.2
 library(scDblFinder) # v.1.10.0
@@ -36,33 +35,6 @@ library(limma) # v.3.52.2
 library(edgeR) # v.3.38.4
 library(ggplot2) # v.3.3.6
 library(RColorBrewer) # v.1.1-3
-
-
-
-
-library(gplots)
-library(pheatmap)
-library(ComplexHeatmap)
-library(circlize)
-
-library(ggrepel)
-library(tidyverse)
-library(org.Mm.eg.db)
-library(ensembldb)
-
-library(scater)
-library(mvoutlier)
-library(DropletUtils)
-
-
-library(dynamicTreeCut)
-library(WGCNA)
-library(cluster)
-library(RSQLite)
-
-library(randomcoloR)
-
-
 ```
 
 
