@@ -1,6 +1,7 @@
 ---
 title: "Châtel-Soulet et al. 2025"
 output: html_document
+author: Athimed El Taher 
 ---
 
 ```{r setup, include=FALSE}
@@ -35,109 +36,122 @@ library(limma) # v.3.52.2
 library(edgeR) # v.3.38.4
 library(ggplot2) # v.3.3.6
 library(RColorBrewer) # v.1.1-3
+library(data.table) # v.1.14.2
 ```
 
 
-# Single cell object
+# Load the single-cell experiment object
 
-With de-multiplexed samples (see Material and method for information about the de-multiplexing)
+For de-multiplexed samples (see Materials and Methods for details about the de-multiplexing process).
 
-```{r sce}
-## Read RDS object containing single cell object of 55,489 genes and 119,037 cells
-sce = readRDS('SingleCellExperiment.rds') # data processed found under GSE261266
+```{r loading_sce}
+
+## Read the RDS object available under GEO record GSE261266
+sce = readRDS('GSE261266_SingleCellExperiment.rds') # contains 55,489 genes and 119,037 cells
 ```
 
 
 # Quality Control
 
-QC metrics to identify low-quality cells based on their expression profiles: 
+QC metrics used to identify low-quality cells based on their expression profiles:
 
-  * The library size
-  * The number of expressed features in each cell (mainly genes and mitochondrial genes)
+  * Library size: < 2,511
+  *  Number of expressed features per cell:
+    - Genes: < 1,250
+    - Mitochondrial genes: > 10 or equal to 0
   
 
 ```{r QC_metrics, echo=FALSE}
+
 ## Basic library properties for each cell
-# Mitochondrial genes
+# Identify mitochondrial genes (prefix "mt-")
 is.mito = grepl("^mt-", rowData(sce)$SYMBOL)
-# Ribosomal genes
+# Identify ribosomal genes (prefix "Rpl" or "Rps")
 is.ribo = grepl("^Rp(l|s)", rowData(sce)$SYMBOL)
-# Cytoplasmic genes
+# Identify selected cytoplasmic genes
 is.cyto =  rowData(sce)$SYMBOL %in% c("Actb", "Tmsb10", "Tmsb4x")
 
 ## QC metrics
-##  library size, Number of gene expressed, proportion of reads mapped to features
+## Compute library size, number of genes expressed, and proportion of reads mapped to selected features
 stats = perCellQCMetrics(sce, subsets=list(MT=is.mito, RIBO=is.ribo, CYTO=is.cyto), flatten=FALSE)
 sce$scater_qc = stats
 
-## Identifying low-quality cells with adaptive thresholds (see material and method section)
+## Identify low-quality cells using adaptive thresholds (see Materials and Methods)
 
-# Library size:
+# 1. Library size
 discard.sum = sce$scater_qc$sum < 2511 
-# Percentage dicarded:
-length(which(discard.sum))/ncol(sce)*100 #  8.35 percent
+# Percentage discarded
+length(which(discard.sum))/ncol(sce)*100 #  8.35 %
 
-# Number of gene expressed:
+# 2. Number of genes expressed
 discard.detected = sce$scater_qc$detected < 1250
-length(which(discard.detected))/ncol(sce)*100 #  8.1 % discarded
+length(which(discard.detected))/ncol(sce)*100 #  8.1 % 
 
-# Cells with more than 0 or max 10% of mitochondrial gene
+# 3. Mitochondrial gene content
+# Discard cells with 0% or >10% mitochondrial reads
 discard.mito = sce$scater_qc$subsets$MT$percent > 10 | sce$scater_qc$subsets$MT$percent == 0
 discard.mito[is.na(discard.mito)] = TRUE
-table(discard.mito) # discard 5,955, keep 113,082
+table(discard.mito) # Discard 5,955 cells, keep 113,082 cells
 
 
-# Summary
+# Summary of low-quality cells
 data.frame(BySum=sum(discard.sum),
            ByFeature=sum(discard.detected),
            ByMito=sum(discard.mito),
            Remaining=sum(!discard.sum & !discard.detected & !discard.mito ))
 
 
-## Removing low-quality cells
-sce = sce[, !discard.sum & !discard.detected & !discard.mito] # 108,503 high quality cells
+## Remove low-quality cells
+sce = sce[, !discard.sum & !discard.detected & !discard.mito] # 108,503 high-quality cells
 ```
 
 # Doublet detection
 
 ```{r doublet_dectection, echo=FALSE}
-# Doublet detection by simulation
-set.seed(100)
+
+# Perform doublet detection using scDblFinder
+set.seed(100) # For reproducibility
 sce = scDblFinder(sce, verbose=TRUE, samples="replicate_id")
 
-# Clean-up metadata
+# Clean up metadata
+# Keep only scDblFinder-related columns in colData
 colData(sce)$scDblFinder = colData(sce)[, grepl("scDblFinder", colnames(colData(sce)))]
+# Remove unnecessary scDblFinder columns
 colData(sce) = colData(sce)[, !grepl("scDblFinder\\.", colnames(colData(sce)))]
 ```
 
-# Normalisation
+# Normalization by deconvolution
 
-Normalization by deconvolution
 
 ```{r normalisation, echo=FALSE}
-# Change rownames GENEID to SYMBOL
+
+# Update row names from GENEID to SYMBOL
 rownames(sce) = rowData(sce)$SYMBOL
 
-# Record average expression
+# Record average expression for each gene
 ave.counts = calculateAverage(sce) 
 rowData(sce)$ave.count = ave.counts
 
-# Gene high in ambient RNA
-to_tag <- vector()
+# Identify genes highly expressed in ambient RNA
+to_tag = vector()
 allAmbiant = NULL
+
 for (samp in unique(sce$SampleName)){
    pos = grep(samp, colnames(rowData(sce)))
    ambient = rowData(sce)[,pos]
    ambient = ambient[order(ambient$ambient,decreasing = T),]
-   ## Tag everything that has a proportion in the ambient RNA higher than 0.001 (0.1%)
+   
+  # Tag genes with ambient proportion > 0.001 (0.1%)
    ambient = ambient[which(ambient$ambient>0.001 & !is.na(ambient$ambient)),]
-   ## Tag the genes in sce object
+   
+  # Collect tagged genes
    to_tag <- unique(c(to_tag, row.names(ambient)))
- }
+}
+
 rowData(sce)$high_in_ambient <- rowData(sce)$GENEID %in% to_tag
 high_ambiant =  rownames(rowData(sce))[which(rowData(sce)$high_in_ambient==TRUE)]
 
-# Pre-clustering step
+# Pre-clustering step for normalization
 bpPar = MulticoreParam(workers = 4, RNGseed = 1234)
 set.seed(1234)
 clusters = quickCluster(sce, 
@@ -146,13 +160,14 @@ clusters = quickCluster(sce,
 colData(sce)$quickCluster = factor(clusters) 
 
 
-# Compute Size factors 
+# Compute size factors using scran
 sce = scran::computeSumFactors(sce, 
                                 cluster = colData(sce)$quickCluster,
                                 subset.row= rowData(sce)$high_in_ambient== FALSE,
                                 positive = TRUE,
                                 min.mean = 0.1)
-# Normalisation
+
+# Perform log-normalization
 sce = logNormCounts(sce)
 
 ```
@@ -160,46 +175,51 @@ sce = logNormCounts(sce)
 # Feature selection
 
 ```{r feature_selection, echo=FALSE}
-# Quantifying technical noise
+
+# Quantify technical noise using Poisson model
 set.seed(100)
 dec.pois = modelGeneVarByPoisson(sce)
-## Store it in the single cell object
+
+# Store variance decomposition in the single-cell object
 rowData(sce)$decomposeVar = dec.pois
 dec.pois = cbind(dec.pois, data.frame(High_in_ambient=rowData(sce)$high_in_ambient))
-## Sort 
+
+# Sort genes by biological variance
 dec.pois = dec.pois[order(dec.pois$bio, decreasing=TRUE),]
 
-# Highly variable gene
-## Extract HVGs (significant ones with remaining variance > 0.3 & FDR<1%)
+# Identify highly variable genes (HVGs)
+# Select genes with FDR < 0.05 and remaining variance > 0.1
 hvg.out =  getTopHVGs(dec.pois,fdr.threshold=0.05, var.threshold=0.1) 
 
-# remove the genes, that are high variable and high in the ambient
+# Remove HVGs that are highly expressed in ambient RNA
 hvg.out = hvg.out[!hvg.out %in% row.names(sce)[rowData(sce)$high_in_ambient == TRUE]]
 
-# PCA 
+# Run PCA using the selected HVGs
 set.seed(1000)
 sce = runPCA(sce, subset_row=hvg.out)
-# Denoise the PCA 
+
+# Denoise PCA using technical variance
 set.seed(1000)
 sce = denoisePCA(sce, technical=rowData(sce)$decomposeVar, subset.row=hvg.out)
 ```
 
 
 
-# Correcting batch effects
+# Removing batch effects
 
 ```{r batch_correction, echo=FALSE}
-## MNN correction
+
+# Perform MNN (Mutual Nearest Neighbors) batch correction
 set.seed(1234)
 mnn.out = fastMNN(sce, batch=sce$batch_full_info, d=50, k=50, subset.row=hvg.out,
                    BSPARAM=BiocSingular::RandomParam(deferred=TRUE))
 
-# runTSNE and UMAP on corrected PCA
+# Run t-SNE and UMAP on corrected PCA
 bpPar = MulticoreParam(workers = 4, RNGseed = 1234)
 mnn.out = runTSNE(mnn.out, dimred="corrected",BPPARAM = bpPar)
 mnn.out = runUMAP(mnn.out, dimred="corrected",BPPARAM = bpPar)
 
-## Add corrected PCA/TSNE/UMAP to sce object
+# Store corrected PCA, t-SNE, and UMAP in the original sce object
 reducedDim(sce, "MNN_Sample_k50") <- reducedDim(mnn.out, "corrected")
 reducedDim(sce, "TSNE_MNN_Sample_k50") <- reducedDim(mnn.out, "TSNE")
 reducedDim(sce, "UMAP_MNN_Sample_k50") <- reducedDim(mnn.out, "UMAP")
@@ -207,92 +227,94 @@ reducedDim(sce, "UMAP_MNN_Sample_k50") <- reducedDim(mnn.out, "UMAP")
 ```
 
 
-# Doublet removal
+# Removing doublets
 
-```{r doublet_removal, echo=F}
-# remove all cells annotated as doublet (scDblFinder) 
-sce = sce[,-which(sce$scDblFinder$scDblFinder.class=='doublet')] # 4508 doublets were removed and 104,013 single cell left. 
+```{r doublets_cleaning, echo=F}
+
+# Remove all cells annotated as doublets by scDblFinder
+sce = sce[,-which(sce$scDblFinder$scDblFinder.class=='doublet')] # 4,508 doublets removed; 104,013 single cells remain
 ```
 
-# Cell cycle assignment
+# Cell cycle phase assignment
 
-```{r Cyclone, echo=FALSE}
-# Using the cyclone() classifier
-## reference dataset
+```{r cyclone, echo=FALSE}
+
+# Use the cyclone() classifier to assign cell cycle phases
+# Load reference dataset of mouse cell cycle markers
 mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
 set.seed(100)
 assignments <- cyclone(sce, mm.pairs, gene.names=rowData(sce)$GENEID, verbose=T, 
                       BPPARAM=BiocParallel::MulticoreParam(4)) 
 
-# Add info into sce object: 
+# Add cell cycle phase information to the sce object
 sce$phases <- assignments$phases
 ```
 
-
-
 # Clustering
 
-main clustering and sub-clustering of cluster 0
 
 ```{r clustering, echo=FALSE}
-## Main clustering
-# convert sce to seurat object
+
+# Main clustering
+# Convert SingleCellExperiment (sce) to Seurat object
 sce.Seurat = sce
 sce.Seurat = removeAltExps(sce.Seurat) 
 rownames(sce.Seurat) = rowData(sce.Seurat)$GENEID
+
+# Keep only relevant reduced dimensions
 reducedDims(sce.Seurat) = reducedDims(sce.Seurat)[c('MNN_Sample_k50','TSNE_MNN_Sample_k50','UMAP_MNN_Sample_k50')]
 reducedDim(sce.Seurat,'pca') = reducedDim(sce.Seurat,'MNN_Sample_k50') 
 reducedDims(sce.Seurat) = reducedDims(sce.Seurat)[c('pca')]
+
+# Convert to Seurat object
 sce.Seurat = as.Seurat(sce.Seurat)
 
-# Find cluster using Seurat functions
+# Find main clusters using Seurat
 set.seed(1234)
-# k.param nearest neighbors
-sce.Seurat = FindNeighbors(sce.Seurat, dims = 1:20)
-# Use knn graph to construct the SNN graph by calculating the neighborhood overlap
-sce.Seurat = FindClusters(sce.Seurat, resolution = 0.6)
-# add clustering to sce object: 
+sce.Seurat = FindNeighbors(sce.Seurat, dims = 1:20) # Construct nearest neighbor graph
+sce.Seurat = FindClusters(sce.Seurat, resolution = 0.6) # Cluster cells
+
+# Add main clustering to sce object
 sce$seurat_res0.6 = Idents(sce.Seurat)
 
 
-## Sub-clustering cluster 0
-# subset the dataset
-sce_cluster_2 = sce[,which(sce$seurat_res0.6=='0')]
-# Feature selection
+# Sub-clustering of cluster 0
+sce_cluster_0 = sce[,which(sce$seurat_res0.6=='0')]
+
+# Feature selection on subset
 set.seed(100)
-dec.pois.sce2 = modelGeneVarByPoisson(sce_cluster_2)
-## Store it 
-rowData(sce_cluster_2)$decomposeVar = dec.pois.sce2
-## Sort it
-dec.pois.sce2 = dec.pois.sce2[order(dec.pois.sce2$bio, decreasing=TRUE),]
-# define HVG for the subset
-hvg.out.sce2 = getTopHVGs(dec.pois.sce2,fdr.threshold=0.05, var.threshold=0.1) # first by default= top2000. 
-# Rerunning PCA using HVGs only
+dec.pois.sce0 = modelGeneVarByPoisson(sce_cluster_0)
+rowData(sce_cluster_0)$decomposeVar = dec.pois.sce0
+dec.pois.sce0 = dec.pois.sce0[order(dec.pois.sce0$bio, decreasing=TRUE),]
+
+# Identify highly variable genes (HVGs)
+hvg.out.sce0 = getTopHVGs(dec.pois.sce0,fdr.threshold=0.05, var.threshold=0.1)
+
+# PCA and denoising
 set.seed(1000)
-sce_cluster_2 = runPCA(sce_cluster_2, subset_row=hvg.out.sce2)
-# Denoise PCA
+sce_cluster_0 = runPCA(sce_cluster_0, subset_row=hvg.out.sce0)
 set.seed(1000)
-sce_cluster_2 = denoisePCA(sce_cluster_2, technical=rowData(sce_cluster_2)$decomposeVar, subset.row=hvg.out.sce2)
-# New batch correction
+sce_cluster_0 = denoisePCA(sce_cluster_0, technical=rowData(sce_cluster_0)$decomposeVar, subset.row=hvg.out.sce0)
+
+# Batch correction
 set.seed(1234)
-mnn.out = fastMNN(sce_cluster_2, 
-                   batch=sce_cluster_2$batch_full_info, d=50, k=50, 
-                   subset.row=hvg.out.sce2,
+mnn.out = fastMNN(sce_cluster_0, 
+                   batch=sce_cluster_0$batch_full_info, d=50, k=50, 
+                   subset.row=hvg.out.sce0,
                    BSPARAM=BiocSingular::RandomParam(deferred=TRUE))
 
-# TSNE AND UMAP
+# t-SNE and UMAP on corrected PCA
 bpPar = MulticoreParam(workers = 4, RNGseed = 1234)
 mnn.out = runTSNE(mnn.out, dimred="corrected",BPPARAM = bpPar)
 mnn.out = runUMAP(mnn.out, dimred="corrected",BPPARAM = bpPar)
 
-# Add to sce object
-reducedDim(sce_cluster_2, "MNN_Sample_k50") <- reducedDim(mnn.out, "corrected")
-reducedDim(sce_cluster_2, "TSNE_MNN_Sample_k50") <- reducedDim(mnn.out, "TSNE")
-reducedDim(sce_cluster_2, "UMAP_MNN_Sample_k50") <- reducedDim(mnn.out, "UMAP")
+# Store corrected embeddings in subset object
+reducedDim(sce_cluster_0, "MNN_Sample_k50") <- reducedDim(mnn.out, "corrected")
+reducedDim(sce_cluster_0, "TSNE_MNN_Sample_k50") <- reducedDim(mnn.out, "TSNE")
+reducedDim(sce_cluster_0, "UMAP_MNN_Sample_k50") <- reducedDim(mnn.out, "UMAP")
 
-
-# Clustering
-sce.Seurat.subset = sce_cluster_2
+# Sub-clustering using Seurat
+sce.Seurat.subset = sce_cluster_0
 sce.Seurat.subset = removeAltExps(sce.Seurat.subset) 
 rownames(sce.Seurat.subset) = rowData(sce.Seurat.subset)$GENEID
 reducedDim(sce.Seurat.subset) = reducedDim(sce.Seurat.subset,'MNN_Sample_k50') 
@@ -300,23 +322,22 @@ reducedDim(sce.Seurat.subset,'pca') = reducedDim(sce.Seurat.subset,'MNN_Sample_k
 reducedDims(sce.Seurat.subset) = reducedDims(sce.Seurat.subset)[c('pca')]
 sce.Seurat.subset = as.Seurat(sce.Seurat.subset)
 
-# Find cluster using seurat 
+# Find sub-clusters
 set.seed(1234)
 sce.Seurat.subset = FindNeighbors(sce.Seurat.subset, dims = 1:20)
 sce.Seurat.subset = FindClusters(sce.Seurat.subset, resolution = 0.3) 
-# Seurat cluster identities
-sce_cluster_2$clustering_fine_0.3 = as.factor(Idents(sce.Seurat.subset))
+sce_cluster_0$clustering_fine_0.3 = as.factor(Idents(sce.Seurat.subset))
 
-## Combine main and sub clusters: 
-sce_cluster_2$clustering_fine_0.3 = as.character(sce_cluster_2$clustering_fine_0.3)
-sce_cluster_2$clustering_fine_0.3[which(sce_cluster_2$clustering_fine_0.3=='0')] = '0.0'
-sce_cluster_2$clustering_fine_0.3[which(sce_cluster_2$clustering_fine_0.3=='1')] = '0.1'
-sce_cluster_2$clustering_fine_0.3[which(sce_cluster_2$clustering_fine_0.3=='2')] = '0.2'
+# Adjust sub-cluster names for clarity
+sce_cluster_0$clustering_fine_0.3 = as.character(sce_cluster_0$clustering_fine_0.3)
+sce_cluster_0$clustering_fine_0.3[which(sce_cluster_0$clustering_fine_0.3=='0')] = '0.0'
+sce_cluster_0$clustering_fine_0.3[which(sce_cluster_0$clustering_fine_0.3=='1')] = '0.1'
+sce_cluster_0$clustering_fine_0.3[which(sce_cluster_0$clustering_fine_0.3=='2')] = '0.2'
 
-## Add final clustering info to sce object
+# Combine main and sub-clustering into final clustering
 final_clustering = as.character(sce$seurat_res0.6)
 names(final_clustering) = colnames(sce)
-final_clustering[colnames(sce_cluster_2)] = sce_cluster_2$clustering_fine_0.3
+final_clustering[colnames(sce_cluster_0)] = sce_cluster_0$clustering_fine_0.3
 sce$final_clustering = final_clustering
 sce$final_clustering = as.factor(sce$final_clustering)
 ```
@@ -326,39 +347,40 @@ sce$final_clustering = as.factor(sce$final_clustering)
 
 # Cell type annotation
 
-Using existing reference
+Using an existing reference (celldex: ImmGenData - Microarray)
 
-```{r cell_annotation, echo=FALSE}
-# Prepare reference dataset (Fast et al. 2021)
-mat = fread("exprMatrix.tsv.gz") # We asked the autors for the processed table
-meta = read.table("meta.tsv", header=T, sep="\t", as.is=T, row.names=1)
-genes = mat[,1][[1]]
-genes = gsub(".+[|]", "", genes)
-mat = data.frame(mat[,-1], row.names=genes)
-colnames(mat) = gsub('.','-',colnames(mat),fixed = T)
-# seurat object
-so = CreateSeuratObject(counts = mat, project = "myProjectName", meta.data=meta)
-sce_fast = as.SingleCellExperiment(so)
-table(rownames(sce_fast)%in%rownames(sce))
-assays(sce_fast) = assays(sce_fast)['logcounts']
+```{r annotation, echo=FALSE}
+# Load the ImmGen Microarray reference dataset
+se <- celldex::ImmGenData()
 
-# run singleR on Fast Louvain.Cluste annotation
-pred_fast = SingleR(test = sce, ref = sce_fast, labels = sce_fast$Louvain.Cluster)
-# add to single cell object
-sce$cell_type_fast_Louvain_Cluster = toupper(as.character(pred_fast$pruned.labels)) 
-# run singleR on Fast surface marker annotation
-pred_fast2 = SingleR(test = sce, ref = sce_fast, labels = sce_fast$surface_marker)
-# add to single cell object
-sce$cell_type_fast_surface_marker <- toupper(as.character(pred_fast2$pruned.labels)) 
+# Extract and inspect reference metadata
+info_immgen_Rna = as.data.frame(colData(se)[,c(1,2)])
+info_immgen_Rna = info_immgen_Rna[!duplicated(info_immgen_Rna[,2]),]
+
+# Check overlap between reference and query gene sets
+table(row.names(se) %in% row.names(sce))
+
+# Run SingleR using the ImmGen reference
+set.seed(123)
+pred_immgen_micro <- SingleR(
+  test = sce,
+  ref = se,
+  labels = se$label.fine
+)
+
+# Add ImmGen-based cell type annotations to the sce object
+sce$immgen_microarray = pred_immgen_micro$pruned.labels
 ```
 
 # Annotation of clusters
 
-The reasoning behind this annotation can be found in the manuscript 
-
-```{r}
-# add the new annotations 
+ The reasoning behind these assignments is described in the manuscript.
+ 
+```{r assignement}
+# Initialize annotation column
 sce$final_annotation = as.character(sce$final_clustering)
+
+# Assign biological identities to clusters
 sce$final_annotation[sce$final_clustering %in% c("0.0")] = "ST-HSC_1"
 sce$final_annotation[sce$final_clustering %in% c("0.2")] = "ST-HSC_2"
 sce$final_annotation[sce$final_clustering %in% c("0.1")] = "LT-HSC"
@@ -385,49 +407,61 @@ sce$final_annotation[sce$final_clustering %in% c("18")] = "B cells pro"
 
 
 
-# Integrating with protein abundance 
+# Integrating protein abundance
 
-Gating stategy following Fast et al. 2021. See material and method for details
+Gating strategy following Fast et al. (2021) https://elifesciences.org/articles/66512
+See the Materials and Methods section for additional details.
+
 
 ```{r gating}
-# ADT expression
+# Extract ADT (antibody-derived tag) expression data
 adt = altExp(sce, 'ADT')
-# log transformation without any normalisation 
+
+# Apply log transformation (log2(counts + 1)) without normalization
 logcounts(adt) = log2(counts(adt)+1)
-# adt logcount matrix
+
+# Create a simplified ADT expression matrix
 adt_matrix = data.frame('CD34'=logcounts(adt)['CD34',],'CD150'=logcounts(adt)['CD150',],'CD48'=logcounts(adt)['CD48',])
 
 
-# Gating of five populations of cells
-## +/-: the threshold used are adaptive thresholds and based on the density plot of expression of the ADTs. 
+# ------------------------------------------------------------------------------
+# Gating strategy for five hematopoietic populations
+# Thresholds were adaptively defined from density plots of ADT expression:
+#   - CD150+: logcount(CD150) > 5.5
+#   - CD150−: logcount(CD150) < 5.5
+#   - CD48+:  logcount(CD48)  > 8
+#   - CD48−:  logcount(CD48)  < 8
+# ------------------------------------------------------------------------------
 
-### Thresholds: 
-### CD150+: logcount(CD150) > 5.5 & CD150-: logcount(CD150) < 5.5 
-### CD48+: logcount(CD48) > 8 & CD150-: logcount(CD48) < 8 
 
-## MPP0: CD150- and CD48- 
+# MPP0: CD150− and CD48−
 gating_fast_MPP0 =  rownames(adt_matrix)[which( adt_matrix[,'CD150'] < 5.5 & adt_matrix[,'CD48'] < 8)] # 10%
 
-## MPP2: CD150+ and CD48+ 
+# MPP2: CD150+ and CD48+
 gating_fast_MPP2 =  rownames(adt_matrix)[which( adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] > 8)] # 10%
 
-## MPP3/4: CD150- and CD48+ 
+# MPP3/4: CD150− and CD48+
 gating_fast_MPP34 =  rownames(adt_matrix)[which( adt_matrix[,'CD150'] < 5.5 & adt_matrix[,'CD48'] > 8)] # 43%
 
-## LT-HSC + ST-HSC/MPP1: CD150+ and CD48- 
+# LT-HSC and ST-HSC/MPP1: CD150+ and CD48−
 adt_cd34 = adt_matrix[which( adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] < 8),'CD34'] 
-### Subdivide this group so that ~80% of them are MPP1 and the rest LT-HSC
+
+# # Define adaptive threshold on CD34 expression
+# Subdivide this group so that ~80% of them are MPP1 and the rest LT-HSC
 cut_30 = sort(adt_cd34,decreasing = F)[round(length(adt_cd34)/100*20)]
-### Expression threshold:
 negativ = which(adt_cd34 < cut_30)
 positiv = which(adt_cd34 >= cut_30)
-### LT-HSC
-gating_fast_LTHSC =  rownames(adt_matrix)[which( adt_matrix[,'CD34'] < cut_30 & adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] < 8)] # 753 (0.72%)
-### MPP1
-gating_fast_MPP1 = rownames(adt_matrix)[which( adt_matrix[,'CD34'] >= cut_30 & adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] < 8)] # 3.3
 
+# LT-HSC: CD34 below the 20th percentile
+gating_fast_LTHSC =  rownames(adt_matrix)[which( adt_matrix[,'CD34'] < cut_30 & adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] < 8)] 
 
-# Add colData information to sce object
+# ST-HSC / MPP1: CD34 above the 20th percentile
+gating_fast_MPP1 = rownames(adt_matrix)[which( adt_matrix[,'CD34'] >= cut_30 & adt_matrix[,'CD150'] > 5.5 & adt_matrix[,'CD48'] < 8)] 
+
+# ------------------------------------------------------------------------------
+# Add gating results to the SCE object
+# ------------------------------------------------------------------------------
+
 sce$gating_fast = 'no_gate'
 sce$gating_fast[which(colnames(sce)%in%gating_fast_LTHSC)] = 'LTHSC'
 sce$gating_fast[which(colnames(sce)%in%gating_fast_MPP1)] = 'STHSC'
@@ -436,7 +470,10 @@ sce$gating_fast[which(colnames(sce)%in%gating_fast_MPP34)] = 'MPP3'
 sce$gating_fast[which(colnames(sce)%in%gating_fast_MPP0)] = 'MPP0'
 
 
-# color accorinding to annotation
+# ------------------------------------------------------------------------------
+# Define colors for visualization
+# ------------------------------------------------------------------------------
+
 color_vector = sce$gating_fast
 color_vector[which(color_vector=='MPP2')] = "#4363d8" 
 color_vector[which(color_vector=='MPP3')] = "#3cb44b" 
@@ -448,22 +485,29 @@ color_vector[which(color_vector=='MPP0')] = "#e5f531"
 ```
 
 
-# Cluster filtering
+# Remove clusters 
 
-Cluster 17, 18 and 19 were removed from the dataset prior to differential expression analysis (see material and method)
+Clusters 17, 18, and 19 were excluded from downstream analyses (see Materials and Methods for details).
 
 ```{r filtering, echo=FALSE}
+# Remove selected clusters prior to differential expression analysis
 sce = sce[,-which(sce$final_clustering%in%c('17','18','19'))]
+
+# Quick summary of remaining clusters
+table(sce$final_clustering)
 ```
 
-# Differential analysis
+# Differential expression analysis
 
-Pseudo-bulk analysis for each the cluster
+
+## Pseudo-bulk aggregation
+Per cluster and sample replicate (see Materials and Methods for details).
 
 ```{r Differential_expression, echo=FALSE}
-# Pseudo-replicate for pseudo-bulk analysis
+# Define pseudo-replicate IDs
 sce$full_info_rev = paste0(sce$day,'_',sce$condition,'_',sce$batchNr)
-# Rename some cluster (alphabetic sorting)
+
+# Prepare cluster identifiers
 sce$final_clustering = paste('clust',sce$final_clustering ,sep='')
 sce$final_clustering[which(sce$final_clustering=='clust0.0')] = 'clust000'
 sce$final_clustering[which(sce$final_clustering=='clust0.1')] = 'clust001'
@@ -479,96 +523,92 @@ sce$final_clustering[which(sce$final_clustering=='clust8')] = 'clust08'
 sce$final_clustering[which(sce$final_clustering=='clust9')] = 'clust09'
 sce$final_clustering = as.factor(sce$final_clustering)
 
-# Split the data according to cluster+pseudo-replicate
+# Define pseudo-bulk sample groups
+# Each pseudo-bulk sample represents a cluster × pseudo-replicate combination
 splitCells = factor(paste0(make.names(sce$final_clustering), ".", sce$full_info_rev))
 num_cells = table(splitCells)
 
-# Filter: Exclude all samples (cluster+pseudo-replicate) with less than 20 cell (minimum threshold for pseudo-bulk)
+# Filter: retain pseudo-bulk samples with ≥20 cells
 excludedCluster = names(num_cells[num_cells < 20]) 
-# Remove all cell belonging to these samples 
 sce.cell = sce[,-which(splitCells%in%excludedCluster)]
 splitCells = factor(paste0(make.names(sce.cell$final_clustering), ".", sce.cell$full_info_rev))
-
-# number of cells per samples and condition
 num_cells = table(splitCells)
 
-## Sum of all cell from each sample
+# Aggregate counts per pseudo-bulk sample
+# Each column in the resulting matrix represents one pseudo-bulk sample
 sum_by_cluster = vapply(split(colnames(sce.cell), splitCells), function(x){ Matrix::rowSums(counts(sce.cell)[, x]) }, numeric(length = nrow(counts(sce.cell)))) 
 
-## Metadata info: Create data frame containing information about the samples 
+# Construct sample metadata (pheno table)
 pheno = data.frame(summed_sample=colnames(sum_by_cluster))
 row.names(pheno = pheno$summed_sample)
 pheno$num_cells = num_cells
+
+# Parse metadata elements
 pheno.comp = pheno
-# cluster + day
+# Extract day, treatment, and fusion status
 clu.day = unlist(lapply(pheno$summed_sample, function(x) strsplit(x,'_')[[1]][1]))
-# cluster 
 pheno.comp$clu = unlist(lapply(pheno$summed_sample, function(x) strsplit(x,'.',fixed = T)[[1]][1]))
-# sample name
 pheno.comp$sam = unlist(lapply(pheno$summed_sample, function(x) strsplit(x,'.',fixed = T)[[1]][2]))
-# day 
 pheno.comp$day = unlist(lapply(pheno.comp$sam, function(x) strsplit(x,'_',fixed=T)[[1]][1]))
-# treatment
 pheno.comp$tpo = unlist(lapply(pheno.comp$sam, function(x) strsplit(x,'_',fixed=T)[[1]][2]))
-# fusion/no fusion
 pheno.comp$fusion =unlist(lapply(pheno.comp$sam, function(x) strsplit(x,'_',fixed=T)[[1]][3]))
-# full condition: day + treatment + fusion
 pheno.comp$condition = paste(pheno.comp$day,pheno.comp$tpo,pheno.comp$fusion,sep='_')
-# Add these info to final data frame
+
+# Add status to sample metadata (pheno table)
 pheno$cluster = factor(pheno.comp$clu)
 pheno$replicate = factor(pheno.comp$sam)
+# Define experimental condition
 pheno$condition = factor(pheno.comp$condition)
 ```
 
+## DGEList creation and contrast testing
+
 ```{r DGEList, echo=FALSE}
-## Create DGEList object 
-# Create unique row names
+# Create unique row names for the pseudo-bulk matrix
 row.names(sum_by_cluster) = uniquifyFeatureNames(rowData(sce)$GENEID, rowData(sce)$SYMBOL)
-# combine info into dgelist
+
+# Combine into DGEList
 dge = DGEList(counts=sum_by_cluster,
              group=factor(paste(pheno$cluster, pheno$condition, sep=".")),
              samples=pheno,
              genes=as.data.frame(rowData(sce.cell)[, c('GENEID','SYMBOL','ENTREZID','uniqueSymbol','DESCRIPTION')]), 
              remove.zeros=FALSE)
 
-# calculate normalization factors
+# Calculate normalization factors (TMM)
 dge = calcNormFactors(dge)
 
-## Gene filtering
-# Keep only the genes that are expressed in at least 2 samples
+# Gene filtering: keep genes expressed (CPM > 1) in at least 2 samples
 keep = rowSums(edgeR::cpm(dge) > 1) >= 2
-# Subset, while updating total counts
 dge = dge[keep, , keep.lib.sizes=FALSE] 
-# Redo normalization (TMM)
+
+# Recompute normalization after filtering
 dge = calcNormFactors(dge) 
-# Clean-up 
+
+# Clean up gene metadata and rownames
 row.names(dge) = dge$genes$GENEID 
-# keep only most informative information
 dge$genes = dge$genes[, c(1, 4, 3, 5)]
 names(dge$genes) = c("GENEID", "SYMBOL", "ENTREZID", "DESCRIPTION")
-# Visualize CPM after filtering
+
+# Visualize CPM (optional)
 log2cpm.raw = edgeR::cpm(dge, log=TRUE, prior.count=8, normalized.lib.sizes=FALSE)
-# and after TMM normalization
 log2cpm = edgeR::cpm(dge, log=TRUE, prior.count=8, normalized.lib.sizes=TRUE) 
 
 
-## design matrix 
+# Design matrix for all groups (used for building contrasts)
 moma = model.matrix(~ 0 + group, data=dge$samples) 
 colnames(moma) = gsub("group", "", colnames(moma)) 
 colnames(moma) = make.names(colnames(moma))
 
 
-## Define cluster names :
-clusters_day2 <- c(
+# Define cluster sets for day2 and day5
+clusters_day2 = c(
   sprintf("clust%03d", 0:2),  # clust000, clust001, clust002
-  sprintf("clust%02d", 1:16)  # clust01 to clust14
+  sprintf("clust%02d", 1:16)  # clust01 to clust16
 )
-
-##cluster 0.02 has not enough replicate at day5:
-clusters_day5 <- setdiff(clusters_day2, "clust002")
+clusters_day5 <- setdiff(clusters_day2, "clust002") # clust002 excluded for day5
 
 
-## Define experimental conditions for contrast
+# Experimental conditions (used in contrast strings)
 conditions <- c("TPO_FUSION", "PBS_FUSION")
 
 ## Function to build contrast definitions per day
@@ -581,14 +621,12 @@ make_contrasts_per_day <- function(day, clusters) {
     )
 }
 
-## Generate contrasts for each day
+## Generate contrasts
 contrasts_day2 <- make_contrasts_per_day("day2", clusters_day2)
 contrasts_day5 <- make_contrasts_per_day("day5", clusters_day5)
-
-## days to generate
 days <- list(day2 = clusters_day2, day5 = clusters_day5)
 
-# helper to generate the four contrasts per cluster/day with exact naming
+# To generate the four contrasts per cluster/day with specific naming
 build_contrasts_for <- function(cluster, day) {
   base <- paste0(cluster, ".", day)        # e.g. "clust000.day2"
   names_vec <- c(
@@ -606,7 +644,7 @@ build_contrasts_for <- function(cluster, day) {
   setNames(formulas, names_vec)
 }
 
-## Build the full named vector of contrasts
+# contrast names
 contrast.list <- unlist(lapply(names(days), function(d) {
   clusts <- days[[d]]
   unlist(lapply(clusts, function(cl) build_contrasts_for(cl, d)))
@@ -614,33 +652,30 @@ contrast.list <- unlist(lapply(names(days), function(d) {
 
 
 
-## build the contrast matrix
+# Build the contrast matrix (use column names of design)
 contrasts.matrix <- makeContrasts(contrasts = contrast.list, levels = moma)
 colnames(contrasts.matrix) = names(contrast.list)
 
 
-## Differential expression per cluster
-# save the results per cluster in fit list
+# Differential expression per contrast (cluster, condition)
+
 fits = list()
 
 # Loop across the contrast
 for (i in 1:ncol(contrasts.matrix)) {
   
-  # Name of the constrast
   contr.name = colnames(contrasts.matrix)[i]
-  
-  # Print info
   message("   Working on ... ", contr.name)
   
-  # Subset samples belonging to the contrast
+  # Identify design rows (samples) that participate in this contrast
+  # Subset DGEList to samples involved in the contrast
   dge.temp = dge[, dge$samples$group %in% names(which(contrasts.matrix[,i] != 0))]
   
-  # Subset genes expressed in at least 2 replicates 
+  #  Keep genes expressed in at least 2 replicates (within this subset)
   keep = rowSums(edgeR::cpm(dge.temp) > 1) >= 2  
-  # Redo normalization 
   dge.temp = dge.temp[keep, , keep.lib.sizes=FALSE] 
   
-  # Filtering step on the minimum number of cells with expression
+  # Further filter genes: must be detected in >= 5% of cells in the relevant single-cell subset
   sce.temp = 
     sce[
       rowData(sce)$GENEID %in% dge.temp$genes$GENEID, 
@@ -651,68 +686,72 @@ for (i in 1:ncol(contrasts.matrix)) {
   dge.temp = dge.temp[keep, , keep.lib.sizes=FALSE] 
   
 
-  # Redo normalization 
+  # Recompute normalization factors
   dge.temp = calcNormFactors(dge.temp) 
   
-  # logExpression
+  # Caluculation of log expression
   log2cpm.temp = edgeR::cpm(dge.temp, log=TRUE, prior.count=8, normalized.lib.sizes=TRUE)
 
-  # Design matrix 
+  # Design matrix for this subset
   moma.temp = model.matrix(~ 0 + group, data=dge.temp$samples) 
-  # Rename column (readability)
   colnames(moma.temp) = gsub("group", "", colnames(moma.temp)) 
   colnames(moma.temp) = make.names(colnames(moma.temp))
 
   
-  # Estimate dispersion
+  # Estimate dispersion and fit GLM
   dge.temp = estimateDisp(dge.temp, moma.temp)
   
-  # Fit a negative binomial generalized log-linear model
+  # Fit model
   fit1 = glmFit(dge.temp, moma.temp, prior.count=8) 
   lrt = glmLRT(fit1, contrast=contrasts.matrix[names(which(contrasts.matrix[,i] != 0)), i])
 
-  ## Add contrast's results to list
+  ## Store results
   fits[[contr.name]] = lrt
-  rm(lrt)
   fits[[contr.name]]$dge = dge.temp
   fits[[contr.name]]$moma = moma.temp
+  fits[[contr.name]]$contrasts = contrasts.matrix[names(which(contrasts.matrix[,i] != 0)), i]
 }
 
 
 ```
 
-# Enrichement analysis
+# Enrichement analysis using CAMERA (MSigDB v7.5.1)
 
-CAMERA (within Limma framework) statistics using MSigDB database v7.5.1
+* Assumes MSigDB mouse (.rds) collections already downloaded (v7.5.1)
+* Each file corresponds to one category (e.g. C2, C5, etc.)
+* Files follow pattern: "*.CATEGORY.ensembl.mmu.GeneIdsList.rds"
 
 
 ```{r GSEA, echo=FALSE}
-## Sets can be download here https://www.gsea-msigdb.org/gsea/msigdb (!!MSigDB v7.5.1)
-## load the downloaded sets within R 
-ff <- list.files(gseaDir, pattern="\\.CATEGORY.*ensembl.mmu\\.GeneIdsList\\.rds")
+# Load gene set collections
+ff <- list.files(gseaDir, pattern="\\.CATEGORY.*ensembl.mmu\\.GeneIdsList\\.rds") # Sets can be download here https://www.gsea-msigdb.org/gsea/msigdb
+
+# Load each set and assign and remove extension
 for (f in ff) {
     assign(sub("\\.GeneIdsList\\.rds","",f), readRDS(sprintf("%s/%s", gseaDir, f)))
 }
 
 
-# store CAMERA results
+# Prepare results list
 res <- list()
 
-# Loop across catergory
+# Loop over each MSigDB category
 for (f in sub("\\.GeneIdsList\\.rds","",ff)) {
 
   res[[f]] <- list()
   message("Working on ... ", f)
+  
+  # Loop across contrasts (each DE test)
   for (i in 1:ncol(contrasts.matrix)) {
     contr.name <- colnames(contrasts.matrix)[i]
     message("   Working on ... ", contr.name)
     
-    ## process and filter msigDB gene sets
+    # Retrieve gene set collection
     indx <- ids2indices(gene.sets=get(f), identifiers=fits[[contr.name]]$dge$genes$GENEID)
     indx <- indx[sapply(indx, length) >= 5] 
     
-    ## add CAMERA stats, using MsigDb
-    ## FDR: Benjamini and Hochberg FDR adjusted p-value.
+    # CAMERA enrichment test 
+    # Store results
     res[[f]][[contr.name]] = camera(y = fits[[contr.name]]$dge,
               index=indx, 
               design = fits[[contr.name]]$moma, 
@@ -725,26 +764,14 @@ for (f in sub("\\.GeneIdsList\\.rds","",ff)) {
               allow.neg.cor=FALSE,
               sort=TRUE)
     
-  
     }
-  
 }
-    
-
-
-
-
-
 
 ```
 
 # Reproducibility
 
-
 ```{r}
-
-
 sessionInfo()
-
 ```
 
